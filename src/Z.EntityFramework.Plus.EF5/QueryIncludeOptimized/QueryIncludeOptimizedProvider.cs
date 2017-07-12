@@ -100,14 +100,28 @@ namespace Z.EntityFramework.Plus
         /// <returns>The object returned by the execution of the expression.</returns>
         public TResult Execute<TResult>(Expression expression)
         {
-            QueryIncludeOptimizedIncludeSubPath.RemoveLazyChild(CurrentQueryable);
-
             var methodCall = expression as MethodCallExpression;
 
             if (methodCall == null)
             {
                 throw new Exception(ExceptionMessage.GeneralException);
             }
+
+            if (methodCall.Method.Name == "All"
+                || methodCall.Method.Name == "Any"
+                || methodCall.Method.Name == "Average"
+                || methodCall.Method.Name == "Contains"
+                || methodCall.Method.Name == "Count"
+                || methodCall.Method.Name == "LongCount"
+                || methodCall.Method.Name == "Max"
+                || methodCall.Method.Name == "Min"
+                || methodCall.Method.Name == "SequenceEqual"
+                || methodCall.Method.Name == "Sum")
+            {
+                return OriginalProvider.Execute<TResult>(expression);
+            }
+
+            QueryIncludeOptimizedIncludeSubPath.RemoveLazyChild(CurrentQueryable);
 
             var currentQuery = CurrentQueryable;
             var currentMethod = methodCall.Method.GetGenericMethodDefinition();
@@ -157,7 +171,7 @@ namespace Z.EntityFramework.Plus
          
             // GET provider
             var objectQueryProviderField = typeof (ObjectQuery).GetProperty("ObjectQueryProvider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            var provider = (IQueryProvider) objectQueryProviderField.GetValue(objectQuery);
+            var provider = (IQueryProvider) objectQueryProviderField.GetValue(objectQuery, null);
 
             // CREATE query from the expression
             var createQueryMethod = provider.GetType().GetMethod("CreateQuery", BindingFlags.NonPublic | BindingFlags.Instance, null, new[] {typeof (Expression)}, null);

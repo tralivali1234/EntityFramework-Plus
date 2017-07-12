@@ -2,10 +2,12 @@
 
 ## Library Powered By
 
-This library is powered by [Entity Framework Extensions](http://entityframework-extensions.net/)
+This library is powered by [Entity Framework Extensions](http://entityframework-extensions.net/?z=github&y=entityframework-plus)
 
-<a href="http://entityframework-extensions.net/">
+<a href="http://entityframework-extensions.net/?z=github&y=entityframework-plus">
+<kbd>
 <img src="https://zzzprojects.github.io/images/logo/entityframework-extensions-pub.jpg" alt="Entity Framework Extensions" />
+</kbd>
 </a>
 
 ## Download
@@ -313,9 +315,9 @@ A **HUGE THANKS** for your help.
 - [Eval-SQL.NET](http://eval-sql.net/)
 - [Eval-Expression.NET](http://eval-expression.net/)
 
-**Others**
+**Utilities**
 - [Extension Methods Library](https://github.com/zzzprojects/Z.ExtensionMethods/)
-- [LINQ Async](https://github.com/zzzprojects/Linq-AsyncExtensions)
+- [Html Agility Pack](http://html-agility-pack.net/)
 
 **Need more info?** info@zzzprojects.com
 
