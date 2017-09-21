@@ -8,9 +8,11 @@
 using System.Runtime.CompilerServices;
 #if EF5
 using System.Data.Objects;
+using System.Data.Entity;
 
 #elif EF6
 using System.Data.Entity.Core.Objects;
+using System.Data.Entity;
 
 #elif EFCORE
 using Microsoft.EntityFrameworkCore;
@@ -35,6 +37,10 @@ namespace Z.EntityFramework.Plus
             CacheWeakFutureBatch = new System.Runtime.CompilerServices.ConditionalWeakTable<DbContext, QueryFutureBatch>();
 #endif
         }
+
+        /// <summary>Gets or sets a value indicating whether we allow query batch.</summary>
+        /// <value>True if allow query batch, false if not.</value>
+        public static bool AllowQueryBatch { get; set; } = true;
 
         /// <summary>Gets or sets the weak table used to cache future batch associated to a context.</summary>
         /// <value>The weak table used to cache future batch associated to a context.</value>
@@ -62,6 +68,16 @@ namespace Z.EntityFramework.Plus
             }
 
             return futureBatch;
+        }
+
+        public static void ExecuteBatch(DbContext context)
+        {
+#if EF5 || EF6
+            var batch = AddOrGetBatch(context.GetObjectContext());
+#elif EFCORE
+            var batch = AddOrGetBatch(context);
+#endif
+            batch.ExecuteQueries();
         }
     }
 }

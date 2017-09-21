@@ -20,6 +20,7 @@ using Z.EntityFramework.Plus.Internal.Core.SchemaObjectModel;
 
 #elif EF6
 using System.Data.Entity.Core.Objects;
+using System.Data.Entity.Infrastructure.Interception;
 using Z.EntityFramework.Plus.Internal.Core.SchemaObjectModel;
 
 #elif EFCORE
@@ -27,6 +28,8 @@ using System.Reflection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Query;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
 
 #endif
 
@@ -38,7 +41,7 @@ namespace Z.EntityFramework.Plus
         /// <summary>The command text template.</summary>
         internal const string CommandTextTemplate = @"
 DELETE
-FROM    A
+FROM    A {Hint}
 FROM    {TableName} AS A
         INNER JOIN ( {Select}
                     ) AS B ON {PrimaryKeys}
@@ -53,6 +56,14 @@ WHERE EXISTS ( SELECT 1 FROM ({Select}) AS B
            )
 ";
         internal const string CommandTextOracleTemplate = @"
+DELETE
+FROM    {TableName}
+WHERE EXISTS ( SELECT 1 FROM ({Select}) B
+               WHERE {PrimaryKeys}
+           )
+";
+
+        internal const string CommandTextSQLiteTemplate = @"
 DELETE
 FROM    {TableName}
 WHERE EXISTS ( SELECT 1 FROM ({Select}) B
@@ -84,7 +95,7 @@ WHILE @rowAffected IS NULL
     OR @rowAffected > 0
     BEGIN
         DELETE TOP ({Top})
-        FROM    A
+        FROM    A {Hint}
         FROM    {TableName} AS A
                 INNER JOIN ( {Select}
                            ) AS B ON {PrimaryKeys}
@@ -112,7 +123,7 @@ WHILE @rowAffected IS NULL
             END
 
         DELETE TOP ({Top})
-        FROM    A
+        FROM    A {Hint}
         FROM    {TableName} AS A
                 INNER JOIN ( {Select}
                            ) AS B ON {PrimaryKeys}
@@ -137,6 +148,10 @@ SELECT  @totalRowAffected
         /// <summary>Gets or sets the batch delay interval in milliseconds (The wait time between batch).</summary>
         /// <value>The batch delay interval in milliseconds (The wait time between batch).</value>
         public int BatchDelayInterval { get; set; }
+
+        /// <summary>Gets or sets a value indicating whether the query use table lock.</summary>
+        /// <value>True if use table lock, false if not.</value>
+        public bool UseTableLock { get; set; }
 
         /// <summary>Gets or sets the DbCommand before being executed.</summary>
         /// <value>The DbCommand before being executed.</value>
@@ -170,10 +185,24 @@ SELECT  @totalRowAffected
             {
                 return 0;
             }
-         
+
             // GET model and info
 #if EF5 || EF6
-            var model = query.GetDbContext().GetModel();
+            var dbContext = query.GetDbContext();
+
+#if EF6
+            if (dbContext.IsInMemoryEffortQueryContext())
+            {
+                var context = query.GetDbContext();
+
+                var list = query.ToList();
+                context.Set<T>().RemoveRange(list);
+                context.SaveChanges();
+                return list.Count;
+            }
+#endif
+
+            var model = dbContext.GetModel();
             var entity = model.Entity<T>();
             var keys = entity.Info.Key.PropertyRefs;
 
@@ -201,6 +230,12 @@ SELECT  @totalRowAffected
                     innerObjectQuery.Context.Connection.Open();
                 }
 
+                if (Executing != null)
+                {
+                    Executing(command);
+                }
+
+#if EF5
                 if (command.GetType().Name == "NpgsqlCommand")
                 {
                     command.CommandText = command.CommandText.Replace("[", "\"").Replace("]", "\"");
@@ -224,14 +259,39 @@ SELECT  @totalRowAffected
                 }
                 else
                 {
-                    if (Executing != null)
-                    {
-                        Executing(command);
-                    }
-
                     var rowAffecteds = (int)command.ExecuteScalar();
                     return rowAffecteds;
                 }
+#elif EF6
+                var interceptionContext = new DbCommandInterceptionContext(dbContext.GetObjectContext().GetInterceptionContext());
+
+                if (command.GetType().Name == "NpgsqlCommand")
+                {
+                    command.CommandText = command.CommandText.Replace("[", "\"").Replace("]", "\"");
+                    int totalRowAffecteds = DbInterception.Dispatch.Command.NonQuery(command, interceptionContext);
+                    return totalRowAffecteds;
+                }
+                else if (command.Connection.GetType().Name.Contains("MySql"))
+                {
+                    int totalRowAffecteds = DbInterception.Dispatch.Command.NonQuery(command, interceptionContext);
+                    return totalRowAffecteds;
+                }
+                else if (command.Connection.GetType().Name.Contains("Oracle") || command.Connection.GetType().Name.Contains("SQLite"))
+                {
+                    int totalRowAffecteds = DbInterception.Dispatch.Command.NonQuery(command, interceptionContext);
+                    return totalRowAffecteds;
+                }
+                else if (command.GetType().Name == "SqlCeCommand")
+                {
+                    int totalRowAffecteds = DbInterception.Dispatch.Command.NonQuery(command, interceptionContext);
+                    return totalRowAffecteds;
+                }
+                else
+                {
+                    var rowAffecteds = (int)DbInterception.Dispatch.Command.Scalar(command, interceptionContext);
+                    return rowAffecteds;
+                }
+#endif
 
             }
             finally
@@ -272,6 +332,11 @@ SELECT  @totalRowAffected
                     dbContext.Database.OpenConnection();
                 }
 
+                if (Executing != null)
+                {
+                    Executing(command);
+                }
+
                 if (command.GetType().Name == "NpgsqlCommand")
                 {
                     command.CommandText = command.CommandText.Replace("[", "\"").Replace("]", "\"");
@@ -283,12 +348,10 @@ SELECT  @totalRowAffected
                     int totalRowAffecteds = command.ExecuteNonQuery();
                     return totalRowAffecteds;
                 }
-                else
+                else if (command.GetType().Name.Contains("Sqlite"))
                 {
-                    if (Executing != null)
-                    {
-                        Executing(command);
-                    }
+                    int totalRowAffecteds = command.ExecuteNonQuery();
+                    return totalRowAffecteds;
                 }
 
                 var rowAffecteds = (int)command.ExecuteScalar();
@@ -302,7 +365,7 @@ SELECT  @totalRowAffected
                 }
             }
 #endif
-        }
+            }
 
 #if EF5 || EF6
         /// <summary>Creates a command to execute the batch operation.</summary>
@@ -317,9 +380,11 @@ SELECT  @totalRowAffected
             // GET command
             var command = query.Context.CreateStoreCommand();
 
+            bool isPostgreSql = command.GetType().Name == "NpgsqlCommand";
             bool isMySql = command.GetType().FullName.Contains("MySql");
             var isSqlCe = command.GetType().Name == "SqlCeCommand";
             var isOracle = command.GetType().Namespace.Contains("Oracle");
+            var isSQLite = command.GetType().Namespace.Contains("SQLite");
 
             // Oracle BindByName
             if (isOracle)
@@ -344,6 +409,10 @@ SELECT  @totalRowAffected
             else if (isSqlCe)
             {
                 tableName = string.Concat("[", store.Table, "]");
+            }
+            else if (isSQLite)
+            {
+                tableName = string.Concat("\"", store.Table, "\"");
             }
             else if (isOracle)
             {
@@ -373,7 +442,7 @@ string.Concat("\"", store.Schema, "\".\"", store.Table, "\"");
             }
 
             // GET command text template
-            var commandTextTemplate = command.GetType().Name == "NpgsqlCommand" ?
+            var commandTextTemplate = isPostgreSql ?
                 CommandTextPostgreSQLTemplate :
                 isOracle ?
                     CommandTextOracleTemplate :
@@ -381,6 +450,8 @@ string.Concat("\"", store.Schema, "\".\"", store.Table, "\"");
                         CommandTextTemplate_MySql :
                         isSqlCe ?
                             CommandTextSqlCeTemplate :
+                            isSQLite ?
+                                CommandTextSQLiteTemplate :
                             BatchSize > 0 ?
                                 BatchDelayInterval > 0 ?
                                     CommandTextWhileDelayTemplate :
@@ -395,11 +466,16 @@ string.Concat("\"", store.Schema, "\".\"", store.Table, "\"");
                 return null;
             }
 
+            if (isPostgreSql && customQuery.Item1.EndsWith("WHERE TRUE = FALSE", StringComparison.InvariantCultureIgnoreCase))
+            {
+                return null;
+            }
+
             var querySelect = customQuery.Item1;
 
             // GET primary key join
             string primaryKeys;
-            if (isSqlCe || isOracle)
+            if (isSqlCe || isOracle || isSQLite)
             {
                 primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat(tableName + ".", EscapeName(x, isMySql, isOracle), " = B.", EscapeName(x, isMySql, isOracle), "")));
             }
@@ -413,7 +489,8 @@ string.Concat("\"", store.Schema, "\".\"", store.Table, "\"");
                 .Replace("{Select}", querySelect)
                 .Replace("{PrimaryKeys}", primaryKeys)
                 .Replace("{Top}", BatchSize.ToString())
-                .Replace("{Delay}", TimeSpan.FromMilliseconds(BatchDelayInterval).ToString(@"hh\:mm\:ss\:fff"));
+                .Replace("{Delay}", TimeSpan.FromMilliseconds(BatchDelayInterval).ToString(@"hh\:mm\:ss\:fff"))
+                .Replace("{Hint}", UseTableLock ? "WITH ( TABLOCK )" : "");
 
             // CREATE command
             command.CommandText = commandTextTemplate;
@@ -443,222 +520,224 @@ string.Concat("\"", store.Schema, "\".\"", store.Table, "\"");
 #elif EFCORE
         public DbCommand CreateCommand(IQueryable query, IEntityType entity)
         {
-#if NETSTANDARD1_3
-            try
+            var context = query.GetDbContext();
+
+            var databaseCreator = context.Database.GetService<IDatabaseCreator>();
+
+            var assembly = databaseCreator.GetType().GetTypeInfo().Assembly;
+            var assemblyName = assembly.GetName().Name;
+
+            MethodInfo dynamicProviderEntityType = null;
+            MethodInfo dynamicProviderProperty = null;
+
+            bool isSqlServer = false;
+            bool isPostgreSQL = false;
+            bool isMySql = false;
+            bool isMySqlPomelo = false;
+            bool isSQLite = false;
+
+            if (assemblyName == "Microsoft.EntityFrameworkCore.SqlServer")
             {
-                Assembly assembly;
-
-                try
-                {
-                    assembly = Assembly.Load(new AssemblyName("Microsoft.EntityFrameworkCore.SqlServer"));
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception(ExceptionMessage.BatchOperations_AssemblyNotFound);
-                }
-
-                if (assembly != null)
-                {
-                    var type = assembly.GetType("Microsoft.EntityFrameworkCore.SqlServerMetadataExtensions");
-
-                    var sqlServerEntityTypeMethod = type.GetMethod("SqlServer", new[] {typeof (IEntityType)});
-                    var sqlServerPropertyMethod = type.GetMethod("SqlServer", new[] {typeof (IProperty)});
-                    var sqlServer = (IRelationalEntityTypeAnnotations) sqlServerEntityTypeMethod.Invoke(null, new[] {entity});
-
-                    // GET mapping
-                    var tableName = string.IsNullOrEmpty(sqlServer.Schema) ?
-                        string.Concat("[", sqlServer.TableName, "]") :
-                        string.Concat("[", sqlServer.Schema, "].[", sqlServer.TableName, "]");
-
-                    // GET keys mappings
-                    var columnKeys = new List<string>();
-                    foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
-                    {
-                        var mappingProperty = sqlServerPropertyMethod.Invoke(null, new[] {propertyKey});
-
-                        var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
-                        columnKeys.Add((string) columnNameProperty.GetValue(mappingProperty));
-                    }
-
-                    // GET command text template
-                    var commandTextTemplate = BatchSize > 0 ?
-                        BatchDelayInterval > 0 ?
-                            CommandTextWhileDelayTemplate :
-                            CommandTextWhileTemplate :
-                        CommandTextTemplate;
-
-                    // GET inner query
-#if EFCORE
-                    RelationalQueryContext queryContext;
-                    var relationalCommand = query.CreateCommand(out queryContext);
-#else
-                    var relationalCommand = query.CreateCommand();
-#endif
-
-                    var querySelect = relationalCommand.CommandText;
-
-                    // GET primary key join
-                    var primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.[", x, "] = B.[", x, "]")));
-
-                    // REPLACE template
-                    commandTextTemplate = commandTextTemplate.Replace("{TableName}", tableName)
-                        .Replace("{Select}", querySelect)
-                        .Replace("{PrimaryKeys}", primaryKeys)
-                        .Replace("{Top}", BatchSize.ToString())
-                        .Replace("{Delay}", TimeSpan.FromMilliseconds(BatchDelayInterval).ToString(@"hh\:mm\:ss\:fff"));
-
-                    // CREATE command
-                    var command = query.GetDbContext().CreateStoreCommand();
-                    command.CommandText = commandTextTemplate;
-
-#if EFCORE
-                    // ADD Parameter
-                foreach (var relationalParameter in relationalCommand.Parameters)
-                {
-                    var parameter = queryContext.ParameterValues[relationalParameter.InvariantName];
-
-                    var param = command.CreateParameter();
-                    param.CopyFrom(relationalParameter, parameter);
-
-                    command.Parameters.Add(param);
-                }
-#else
-                // ADD Parameter
-                var parameterCollection = relationalCommand.Parameters;
-                foreach (var parameter in parameterCollection)
-                {
-                    var param = command.CreateParameter();
-                    param.CopyFrom(parameter);
-
-                    command.Parameters.Add(param);
-                }
-#endif
-
-                    return command;
-                }
-                return null;
+                isSqlServer = true;
+                var type = assembly.GetType("Microsoft.EntityFrameworkCore.SqlServerMetadataExtensions");
+                dynamicProviderEntityType = type.GetMethod("SqlServer", new[] { typeof(IEntityType) });
+                dynamicProviderProperty = type.GetMethod("SqlServer", new[] { typeof(IProperty) });
             }
-            catch (Exception)
+            else if (assemblyName == "Npgsql.EntityFrameworkCore.PostgreSQL")
             {
-                return null;
+                isPostgreSQL = true;
+                var type = assembly.GetType("Microsoft.EntityFrameworkCore.NpgsqlMetadataExtensions");
+                dynamicProviderEntityType = type.GetMethod("Npgsql", new[] { typeof(IEntityType) });
+                dynamicProviderProperty = type.GetMethod("Npgsql", new[] { typeof(IProperty) });
             }
-#else
-
-            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(x => x.FullName.StartsWith("Microsoft.EntityFrameworkCore.SqlServer", StringComparison.InvariantCulture));
-            var postgreSqlAssembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(x => x.FullName.StartsWith("Npgsql.EntityFrameworkCore.PostgreSQL", StringComparison.InvariantCulture));
-
-            if (assembly != null || postgreSqlAssembly != null)
+            else if (assemblyName == "MySql.Data.EntityFrameworkCore")
             {
-                string tableName = "";
-                var columnKeys = new List<string>();
-                string primaryKeys = "";
-
-                if (assembly != null)
-                {
-                    var type = assembly.GetType("Microsoft.EntityFrameworkCore.SqlServerMetadataExtensions");
-                    var sqlServerEntityTypeMethod = type.GetMethod("SqlServer", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(IEntityType) }, null);
-                    var sqlServerPropertyMethod = type.GetMethod("SqlServer", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(IProperty) }, null);
-                    var sqlServer = (IRelationalEntityTypeAnnotations)sqlServerEntityTypeMethod.Invoke(null, new[] { entity });
-
-                    // GET mapping
-                    tableName = string.IsNullOrEmpty(sqlServer.Schema) ?
-                        string.Concat("[", sqlServer.TableName, "]") :
-                        string.Concat("[", sqlServer.Schema, "].[", sqlServer.TableName, "]");
-
-                    // GET keys mappings
-                    foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
-                    {
-                        var mappingProperty = sqlServerPropertyMethod.Invoke(null, new[] { propertyKey });
-
-                        var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
-                        columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
-                    }
-
-                    // GET primary key join
-                    primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.[", x, "] = B.[", x, "]")));
-                }
-                else if (postgreSqlAssembly != null)
-                {
-                    var type = postgreSqlAssembly.GetType("Microsoft.EntityFrameworkCore.NpgsqlMetadataExtensions");
-                    var sqlServerEntityTypeMethod = type.GetMethod("Npgsql", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(IEntityType) }, null);
-                    var sqlServerPropertyMethod = type.GetMethod("Npgsql", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(IProperty) }, null);
-                    var sqlServer = (IRelationalEntityTypeAnnotations)sqlServerEntityTypeMethod.Invoke(null, new[] { entity });
-
-                    // GET mapping
-                    tableName = string.IsNullOrEmpty(sqlServer.Schema) ?
-                        string.Concat("\"", sqlServer.TableName, "\"") :
-                        string.Concat("\"", sqlServer.Schema, "\".\"", sqlServer.TableName, "\"");
-
-                    // GET keys mappings
-                    foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
-                    {
-                        var mappingProperty = sqlServerPropertyMethod.Invoke(null, new[] { propertyKey });
-
-                        var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
-                        columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
-                    }
-
-                    primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.\"", x, "\" = B.\"", x, "\"")));
-                }
-
-
-                // GET command text template
-                var commandTextTemplate = assembly == null && postgreSqlAssembly != null ?
-                    CommandTextPostgreSQLTemplate :
-                    BatchSize > 0 ?
-                    BatchDelayInterval > 0 ?
-                        CommandTextWhileDelayTemplate :
-                        CommandTextWhileTemplate :
-                    CommandTextTemplate;
-
-                // GET inner query
-#if EFCORE
-                RelationalQueryContext queryContext;
-                var relationalCommand = query.CreateCommand(out queryContext);
-#else
-                var relationalCommand = query.CreateCommand();
-#endif
-                var querySelect = relationalCommand.CommandText;
-
-
-                // REPLACE template
-                commandTextTemplate = commandTextTemplate.Replace("{TableName}", tableName)
-                    .Replace("{Select}", querySelect)
-                    .Replace("{PrimaryKeys}", primaryKeys)
-                    .Replace("{Top}", BatchSize.ToString())
-                    .Replace("{Delay}", TimeSpan.FromMilliseconds(BatchDelayInterval).ToString(@"hh\:mm\:ss\:fff"));
-
-                // CREATE command
-                var command = query.GetDbContext().CreateStoreCommand();
-                command.CommandText = commandTextTemplate;
-
-#if EFCORE
-                // ADD Parameter
-                foreach (var relationalParameter in relationalCommand.Parameters)
-                {
-                    var parameter = queryContext.ParameterValues[relationalParameter.InvariantName];
-
-                    var param = command.CreateParameter();
-                    param.CopyFrom(relationalParameter, parameter);
-
-                    command.Parameters.Add(param);
-                }
-#else
-                // ADD Parameter
-                var parameterCollection = relationalCommand.Parameters;
-                foreach (var parameter in parameterCollection)
-                {
-                    var param = command.CreateParameter();
-                    param.CopyFrom(parameter);
-
-                    command.Parameters.Add(param);
-                }
-#endif
-
-                return command;
+                isMySql = true;
+                var type = assembly.GetType("MySQL.Data.EntityFrameworkCore.MySQLMetadataExtensions");
+                dynamicProviderEntityType = type.GetMethod("MySQL", new[] { typeof(IEntityType) });
+                dynamicProviderProperty = type.GetMethod("MySQL", new[] { typeof(IProperty) });
             }
-            return null;
+            else if (assemblyName == "Pomelo.EntityFrameworkCore.MySql")
+            {
+                isMySqlPomelo = true;
+                var type = assembly.GetType("Microsoft.EntityFrameworkCore.MySqlMetadataExtensions");
+                dynamicProviderEntityType = type.GetMethod("MySql", new[] { typeof(IEntityType) });
+                dynamicProviderProperty = type.GetMethod("MySql", new[] { typeof(IProperty) });
+            }
+            else if (assemblyName == "Microsoft.EntityFrameworkCore.Sqlite")
+            {
+                isSQLite = true;
+
+                // CHANGE all for this one?
+                dynamicProviderEntityType = typeof(RelationalMetadataExtensions).GetMethod("Relational", new[] { typeof(IEntityType) });
+                dynamicProviderProperty = typeof(RelationalMetadataExtensions).GetMethod("Relational", new[] { typeof(IProperty) });
+            }
+            else
+            {
+                throw new Exception(string.Format(ExceptionMessage.Unsupported_Provider, assemblyName));
+            }
+
+            
+            string tableName = "";
+            var columnKeys = new List<string>();
+            string primaryKeys = "";
+
+            if (isSqlServer)
+            {
+                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
+
+                // GET mapping
+                tableName = string.IsNullOrEmpty(sqlServer.Schema) ?
+                    string.Concat("[", sqlServer.TableName, "]") :
+                    string.Concat("[", sqlServer.Schema, "].[", sqlServer.TableName, "]");
+
+                // GET keys mappings
+                foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
+                {
+                    var mappingProperty = dynamicProviderProperty.Invoke(null, new[] { propertyKey });
+
+                    var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
+                    columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
+                }
+
+                // GET primary key join
+                primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.[", x, "] = B.[", x, "]")));
+            }
+            else if (isPostgreSQL)
+            {
+                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
+
+                // GET mapping
+                tableName = string.IsNullOrEmpty(sqlServer.Schema) ?
+                    string.Concat("\"", sqlServer.TableName, "\"") :
+                    string.Concat("\"", sqlServer.Schema, "\".\"", sqlServer.TableName, "\"");
+
+                // GET keys mappings
+                foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
+                {
+                    var mappingProperty = dynamicProviderProperty.Invoke(null, new[] { propertyKey });
+
+                    var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
+                    columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
+                }
+
+                primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.\"", x, "\" = B.\"", x, "\"")));
+            }
+            else if (isMySqlPomelo)
+            {
+                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
+
+                // GET mapping
+                tableName = string.Concat("`", sqlServer.TableName, "`");
+
+                // GET keys mappings
+                foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
+                {
+                    var mappingProperty = dynamicProviderProperty.Invoke(null, new[] { propertyKey });
+
+                    var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
+                    columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
+                }
+
+                primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.`", x, "` = B.`", x, "`")));
+            }
+            else if (isMySql)
+            {
+                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
+
+                // GET mapping
+                tableName = string.Concat("`", sqlServer.TableName, "`");
+
+                // GET keys mappings
+                foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
+                {
+                    var mappingProperty = dynamicProviderProperty.Invoke(null, new[] { propertyKey });
+
+                    var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
+                    columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
+                }
+
+                primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat("A.`", x, "` = B.`", x, "`")));
+            }
+            else if (isSQLite)
+            {
+                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
+
+                // GET mapping
+                tableName = string.Concat("\"", sqlServer.TableName, "\"");
+
+                // GET keys mappings
+                foreach (var propertyKey in entity.GetKeys().ToList()[0].Properties)
+                {
+                    var mappingProperty = dynamicProviderProperty.Invoke(null, new[] { propertyKey });
+
+                    var columnNameProperty = mappingProperty.GetType().GetProperty("ColumnName", BindingFlags.Public | BindingFlags.Instance);
+                    columnKeys.Add((string)columnNameProperty.GetValue(mappingProperty));
+                }
+
+                primaryKeys = string.Join(Environment.NewLine + "AND ", columnKeys.Select(x => string.Concat(tableName + "." + "\"" + x + "\"", " = B.\"", x, "\"")));
+            }
+
+
+            // GET command text template
+            var commandTextTemplate = isPostgreSQL ?
+                CommandTextPostgreSQLTemplate :
+                isMySql || isMySqlPomelo ? 
+                CommandTextTemplate_MySql :
+                isSQLite ?
+                CommandTextSQLiteTemplate :
+                BatchSize > 0 ?
+                BatchDelayInterval > 0 ?
+                    CommandTextWhileDelayTemplate :
+                    CommandTextWhileTemplate :
+                CommandTextTemplate;
+
+            // GET inner query
+#if EFCORE
+            RelationalQueryContext queryContext;
+            var relationalCommand = query.CreateCommand(out queryContext);
+#else
+            var relationalCommand = query.CreateCommand();
 #endif
+            var querySelect = relationalCommand.CommandText;
+
+
+            // REPLACE template
+            commandTextTemplate = commandTextTemplate.Replace("{TableName}", tableName)
+                .Replace("{Select}", querySelect)
+                .Replace("{PrimaryKeys}", primaryKeys)
+                .Replace("{Top}", BatchSize.ToString())
+                .Replace("{Delay}", TimeSpan.FromMilliseconds(BatchDelayInterval).ToString(@"hh\:mm\:ss\:fff"))
+                .Replace("{Hint}", UseTableLock ? "WITH ( TABLOCK )" : "");
+
+            // CREATE command
+            var command = query.GetDbContext().CreateStoreCommand();
+            command.CommandText = commandTextTemplate;
+
+#if EFCORE
+            // ADD Parameter
+            foreach (var relationalParameter in relationalCommand.Parameters)
+            {
+                var parameter = queryContext.ParameterValues[relationalParameter.InvariantName];
+
+                var param = command.CreateParameter();
+                param.CopyFrom(relationalParameter, parameter);
+
+                command.Parameters.Add(param);
+            }
+#else
+            // ADD Parameter
+            var parameterCollection = relationalCommand.Parameters;
+            foreach (var parameter in parameterCollection)
+            {
+                var param = command.CreateParameter();
+                param.CopyFrom(parameter);
+
+                command.Parameters.Add(param);
+            }
+#endif
+
+            return command;
         }
 #endif
         public string EscapeName(string name, bool isMySql, bool isOracle)

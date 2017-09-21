@@ -1,4 +1,4 @@
-﻿// Description: Entity Framework Bulk Operations & Utilities (EF Bulk SaveChanges, Insert, Update, Delete, Merge | LINQ Query Cache, Deferred, Filter, IncludeFilter, IncludeOptimize | Audit)
+﻿ // Description: Entity Framework Bulk Operations & Utilities (EF Bulk SaveChanges, Insert, Update, Delete, Merge | LINQ Query Cache, Deferred, Filter, IncludeFilter, IncludeOptimize | Audit)
 // Website & Documentation: https://github.com/zzzprojects/Entity-Framework-Plus
 // Forum & Issues: https://github.com/zzzprojects/EntityFramework-Plus/issues
 // License: https://github.com/zzzprojects/EntityFramework-Plus/blob/master/LICENSE
@@ -10,6 +10,7 @@ using System.Collections;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Threading.Tasks;
 #if EF5
 using System.Data.Objects;
 
@@ -65,6 +66,20 @@ namespace Z.EntityFramework.Plus
             }
         }
 
+#if NET45 
+        /// <summary>Gets the value of the future query.</summary>
+        /// <value>The value of the future query.</value>
+        public async Task<TResult> ValueAsync()
+        {
+            if (!HasValue)
+            {
+                await OwnerBatch.ExecuteQueriesAsync().ConfigureAwait(false);
+            }
+
+            return _result;
+        }
+#endif
+
         /// <summary>Sets the result of the query deferred.</summary>
         /// <param name="reader">The reader returned from the query execution.</param>
         public override void SetResult(DbDataReader reader)
@@ -114,6 +129,24 @@ namespace Z.EntityFramework.Plus
 
             _result = value;
             HasValue = true;
+        }
+
+        internal void GetResultDirectly(IQueryable<TResult> query)
+        {
+            var value = query.Provider.Execute<TResult>(query.Expression);
+
+            _result = value;
+            HasValue = true;
+        }
+
+        /// <summary>
+        /// Performs an implicit conversion from QueryFutureValue to TResult.
+        /// </summary>
+        /// <param name="futureValue">The future value.</param>
+        /// <returns>The result of forcing this lazy value.</returns>
+        public static implicit operator TResult(QueryFutureValue<TResult> futureValue)
+        {
+            return futureValue.Value;
         }
     }
 }
